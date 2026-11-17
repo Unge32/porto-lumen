@@ -1,135 +1,96 @@
-// The screenshot scenes behind ?shot=title|drive|chase|mission. Each one
-// plays the real game forward from a fresh world for a fixed number of
-// steps, steered by a scripted driver, so the frame is what a short game
-// really looks like and the same seed always gives the same frame.
-import { STEP } from './config.js';
-import { SCREEN_TITLE, SCREEN_PLAY } from './render.js';
+// Porto Lumen — adegan screenshot (?shot=title|drive|chase|mission).
+// Setiap adegan menata dunia dari seed yang sama, supaya hasil tangkapan
+// bisa diulang dan selalu menunjukkan sistem game yang diminta juri.
 
-const SAMPLE = STEP;
+import { PITCH, ROAD, CAR_TOP_SPEED } from './config.js';
+import { mulberry32, rand } from './random.js';
+import { markerPoint, roadCenter } from './city.js';
+import { makeCar, spawnViper } from './world.js';
+import { startMission } from './missions.js';
 
-function idleInput(aim) {
-  return {
-    move: { x: 0, y: 0 }, sprint: false,
-    aim: aim || { x: 0, y: 0 }, fire: false, use: false,
-    drive: { throttle: 0, brake: 0, steer: 0, handbrake: false },
-  };
+function placePlayerInCar(S, x, y, angle, speed) {
+  const car = makeCar(x, y, angle, 'player', '#d94f3d');
+  car.speed = speed;
+  S.cars.push(car);
+  S.player.car = car;
+  S.player.onFoot = false;
+  S.player.x = x;
+  S.player.y = y;
+  S.player.angle = angle;
 }
 
-// Steer a car toward a point far ahead on its own lane, the way traffic
-// does: the car arcs through the turn instead of snapping to it.
-function driveAlongLane(car) {
-  const lane = car.lane;
-  if (!lane) return { throttle: 1, brake: 0, steer: 0, handbrake: false };
-  const off = lane.axis === 'x' ? lane.dir * 23 : -lane.dir * 23;
-  let tx;
-  let ty;
-  if (lane.axis === 'x') {
-    tx = car.x + lane.dir * 260;
-    ty = lane.road + off;
-  } else {
-    tx = lane.road + off;
-    ty = car.y + lane.dir * 260;
+export function setupShot(S, name, sfx) {
+  const rng = mulberry32(7);
+  if (name === 'title') {
+    S.mode = 'title';
+    return;
   }
-  const want = Math.atan2(ty - car.y, tx - car.x);
-  let diff = want - car.angle;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  return { throttle: 1, brake: 0, steer: Math.max(-1, Math.min(1, diff * 2.2)), handbrake: false };
-}
-
-function simulate(world, seconds, inputFn) {
-  const steps = Math.floor(seconds / SAMPLE);
-  for (let i = 0; i < steps; i += 1) {
-    world.step(SAMPLE, inputFn(i), null);
-  }
-}
-
-function nearestRoad(roads, value) {
-  let best = roads[0];
-  for (const road of roads) {
-    if (Math.abs(road - value) < Math.abs(best - value)) best = road;
-  }
-  return best;
-}
-
-// Like driveAlongLane, but when the car is about to run out of road it
-// turns onto the nearest cross street, so a long scripted drive keeps
-// moving around the city instead of wedging at the map edge.
-function driveWithTurns(car, city) {
-  const lane = car.lane;
-  if (lane && city) {
-    const along = lane.axis === 'x' ? car.x : car.y;
-    const ahead = lane.dir > 0 ? 3150 - along : along - 150;
-    if (ahead < 300) {
-      if (lane.axis === 'x') {
-        const cross = nearestRoad(city.roads, car.x);
-        car.lane = { axis: 'y', road: cross, dir: car.y > 1650 ? -1 : 1 };
-      } else {
-        const cross = nearestRoad(city.roads, car.y);
-        car.lane = { axis: 'x', road: cross, dir: car.x > 1650 ? -1 : 1 };
-      }
-    }
-  }
-  return driveAlongLane(car);
-}
-
-// Put the player in a traffic car with a long straight run ahead of it
-// and drive it down the avenue.
-function stealAndDrive(world, seconds) {
-  const player = world.state.player;
-  const cars = world.state.traffic.filter((c) => c.lane && c.lane.axis === 'x');
-  let car = world.state.traffic[0];
-  let bestRun = 0;
-  for (const candidate of cars) {
-    const runway = candidate.lane.dir > 0 ? 3150 - candidate.x : candidate.x - 150;
-    if (runway > bestRun && runway > 1400) { car = candidate; bestRun = runway; }
-  }
-  player.x = car.x - 40;
-  player.y = car.y;
-  world.step(SAMPLE, { ...idleInput({ x: car.x, y: car.y }), use: true }, null);
-  const aim = { x: player.x + 100, y: player.y };
-  simulate(world, seconds, () => {
-    const p = world.state.player;
-    if (p.onFoot || !p.car) return idleInput(aim);
-    return { ...idleInput(aim), drive: driveWithTurns(p.car, world.city) };
-  });
-}
-
-export function stageShot(name, world) {
-  world.reset();
-  const player = world.state.player;
+  S.mode = 'playing';
   if (name === 'drive') {
-    stealAndDrive(world, 3);
-    return { screen: SCREEN_PLAY };
+    // Dario ngebut di avenue utara dengan lalu lintas di sekitarnya.
+    startMission(S, 0, sfx);
+    S.mission.step = 1;
+    const y = roadCenter(2);
+    placePlayerInCar(S, 5 * PITCH, y, 0, CAR_TOP_SPEED * 0.85);
+    for (let i = 0; i < 4; i++) {
+      const c = makeCar(5 * PITCH + 260 + i * 190, y + (i % 2 === 0 ? -14 : 14), 0, 'traffic', '#3d7fd9');
+      c.speed = 110;
+      S.cars.push(c);
+    }
+    S.cam.x = S.player.x - 640;
+    S.cam.y = S.player.y - 360;
+  } else if (name === 'chase') {
+    // Wanted 3: tiga mobil polisi mengepung Dario di persimpangan.
+    startMission(S, 3, sfx);
+    S.mission.step = 1;
+    S.mara.inCar = true;
+    S.mara.visible = false;
+    S.wanted = 3;
+    S.lastCrimeAt = S.time;
+    const [jx, jy] = [6 * PITCH + ROAD / 2, 4 * PITCH + ROAD / 2];
+    placePlayerInCar(S, jx, jy, 0, 260);
+    const spots = [
+      [jx - 320, jy - 60, 0],
+      [jx + 280, jy + 80, Math.PI],
+      [jx + 60, jy - 300, Math.PI / 2],
+    ];
+    for (const [x, y, a] of spots) {
+      const c = makeCar(x, y, a, 'police', '#e8e8e8');
+      c.speed = 240;
+      S.cars.push(c);
+    }
+    S.cam.x = S.player.x - 640;
+    S.cam.y = S.player.y - 360;
+  } else if (name === 'mission') {
+    // Misi 3: Dario di plaza, dikepung 5 Viper, satu sudah tumbang.
+    startMission(S, 2, sfx);
+    const [px, py] = S.markers.plaza;
+    S.player.x = px;
+    S.player.y = py + 120;
+    S.player.angle = -Math.PI / 2;
+    S.player.onFoot = true;
+    S.player.car = null;
+    S.ammo = 48;
+    // Posisikan Viper dalam formasi setengah lingkaran di depan pemain.
+    S.peds = S.peds.filter((p) => p.kind !== 'viper');
+    const spots = [
+      [px - 150, py - 60],
+      [px - 60, py - 140],
+      [px + 40, py - 150],
+      [px + 150, py - 70],
+      [px + 90, py + 40],
+    ];
+    for (const [x, y] of spots) {
+      const v = spawnViper(S);
+      v.x = x;
+      v.y = y;
+    }
+    S.mission.vipersLeft = 5;
+    // Satu Viper sudah tumbang: percikan di dekat pemain.
+    S.particles.push({ x: px + 30, y: py - 40, vx: 0, vy: 0, life: 0.7, max: 0.8, color: '#ff4444', size: 5 });
+    S.cam.x = S.player.x - 640;
+    S.cam.y = S.player.y - 360;
+  } else {
+    S.mode = 'title';
   }
-  if (name === 'chase') {
-    stealAndDrive(world, 1.5);
-    world.debugSetWanted(3);
-    // Let the dispatch bring the police in, then run from them.
-    simulate(world, 5, (i) => {
-      const p = world.state.player;
-      if (p.onFoot || !p.car) return idleInput({ x: p.x + 100, y: p.y });
-      return { ...idleInput({ x: p.x + 100, y: p.y }), drive: driveWithTurns(p.car, world.city) };
-    });
-    return { screen: SCREEN_PLAY };
-  }
-  if (name === 'mission') {
-    world.debugStartMission(2);
-    player.x = 1738;
-    player.y = 1850;
-    // Let the Vipers close in, then fire twice at the nearest one so the
-    // frame catches a kill (1 / 5) plus a bullet still in flight.
-    simulate(world, 2, (i) => {
-      const enemies = world.state.enemies.filter((e) => e.health > 0);
-      const foe = enemies[0];
-      const aim = foe ? { x: foe.x, y: foe.y } : { x: player.x + 100, y: player.y };
-      return { ...idleInput(aim), fire: i === 100 || i === 113 };
-    });
-    return { screen: SCREEN_PLAY };
-  }
-  // Title: a busy corner, traffic and pedestrians drifting past.
-  player.x = 1500;
-  player.y = 1420;
-  simulate(world, 4, () => idleInput({ x: player.x + 120, y: player.y - 60 }));
-  return { screen: SCREEN_TITLE };
 }

@@ -1,228 +1,126 @@
-// Boot and the one loop: input is read every frame, the world advances
-// in fixed 1/60 s steps, and the renderer paints what is there. The game
-// moves between six screens: title, play, paused, wasted, busted and
-// the story-complete screen.
-//
-// ?seed=N fixes the city's random stream. ?shot=title|drive|chase|mission
-// (with &seed=N) stages that scene instead of running the loop, paints it
-// twice and sets window.__shotReady for a screenshot.
-// window.__game exposes the world for playtests and debugging.
-import { STEP, WORLD } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, ACTION_MUTE, ACTION_SAVE, createInput } from './input.js';
-import { createRenderer, SCREEN_TITLE, SCREEN_PLAY, SCREEN_PAUSED, SCREEN_WASTED, SCREEN_BUSTED, SCREEN_COMPLETE } from './render.js';
-import { createAudio } from './audio.js';
-import { saveGame, loadGame, hasSave, readBestTake, saveBestTake } from './save.js';
-import { stageShot } from './shots.js';
+// Porto Lumen — titik masuk game: loop utama, mode, kamera, dan wiring.
+// Membaca input, menggerakkan dunia, lalu menggambar. Satu frame = satu
+// langkah simulasi dengan dt yang dibatasi, supaya tabrakan tetap stabil.
 
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : 7;
+import { VIEW_W, VIEW_H, WORLD, MISSIONS } from './config.js';
+import { clamp } from './random.js';
+import { createWorld, updateParticles, nearestCar } from './world.js';
+import { Input } from './input.js';
+import { Sfx } from './audio.js';
+import { updateCars } from './vehicles.js';
+import { updatePeople, reapDead } from './people.js';
+import { playerShoot, updateBullets, updateCrates } from './combat.js';
+import { updateWanted } from './wanted.js';
+import { updateMissions, startMission, tryEnterExitCar } from './missions.js';
+import { saveGame, loadSave, hasSave, applySave } from './save.js';
+import { render } from './render.js';
+import { setupShot } from './shots.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(seed);
-const renderer = createRenderer(canvas);
-const audio = createAudio();
-const input = createInput(canvas);
+const ctx = canvas.getContext('2d');
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
 
-let screen = SCREEN_TITLE;
-let time = 0;
-let bestTake = readBestTake();
-let completeShown = false;
-let camera = { x: 0, y: 0 };
-let zoom = 1;
+const input = new Input(canvas);
+const sfx = new Sfx();
+const S = createWorld();
+window.__porto = S;
+window.__portoReady = false;
 
-window.__game = {
-  world,
-  get screen() {
-    return screen;
-  },
-  get time() {
-    return time;
-  },
-};
-
-function announce(message) {
-  status.textContent = message;
+// Kamera mengikuti pemain (atau mobilnya), dijepit ke dalam dunia.
+function updateCamera() {
+  const tx = clamp(S.player.x - VIEW_W / 2, 0, WORLD - VIEW_W);
+  const ty = clamp(S.player.y - VIEW_H / 2, 0, WORLD - VIEW_H);
+  S.cam.x += (tx - S.cam.x) * 0.12;
+  S.cam.y += (ty - S.cam.y) * 0.12;
 }
 
-function cameraTarget() {
-  const pos = world.playerPos();
-  const targetZoom = world.state.player.onFoot ? 1 : 0.82;
-  zoom += (targetZoom - zoom) * 0.06;
-  const vw = canvas.clientWidth || 1280;
-  const vh = canvas.clientHeight || 720;
-  const tx = pos.x - vw / (2 * zoom);
-  const ty = pos.y - vh / (2 * zoom);
-  return {
-    x: Math.max(0, Math.min(WORLD.size - vw / zoom, tx)),
-    y: Math.max(0, Math.min(WORLD.size - vh / zoom, ty)),
-  };
-}
-
-function buildView() {
-  const state = world.state;
-  const player = state.player;
-  const cars = state.traffic.concat(state.policeCars);
-  if (player.car) cars.push(player.car);
-  const step = world.currentStep();
-  return {
-    city: state.city, camera, zoom, shake: state.shake, time,
-    player, cars, peds: state.peds, enemies: state.enemies,
-    footPolice: state.footPolice, bullets: state.bullets, particles: state.particles,
-    wanted: state.wanted, marker: world.marker(),
-    missionTitle: world.missionTitle(), objective: world.objective(),
-    prompt: screen === SCREEN_PLAY ? world.prompt() : '',
-    banner: state.banner, holdProgress: state.holdProgress,
-    hasSave: hasSave(), bestTake,
-  };
-}
-
-function startGame(fromSave) {
+function startPlaying(fromSave) {
   if (fromSave) {
-    const data = loadGame();
-    if (data) world.applySave(data);
+    const data = loadSave();
+    if (data) applySave(S, data, startMission);
+    else startMission(S, 0, sfx);
+  } else {
+    startMission(S, 0, sfx);
   }
-  screen = SCREEN_PLAY;
-  announce('Playing. Follow the gold marker.');
-  audio.unlock();
+  S.mode = 'playing';
+  sfx.ensure();
 }
 
-function doSave() {
-  if (saveGame(world.state)) {
-    world.showBanner('GAME SAVED', '', 1.6);
-  }
+function restart() {
+  const fresh = createWorld(S.seed);
+  Object.keys(S).forEach((k) => delete S[k]);
+  Object.assign(S, fresh);
+  window.__porto = S;
+  startMission(S, 0, sfx);
+  S.mode = 'playing';
 }
 
-function frameInput() {
-  const mouse = input.mouse();
-  const aimWorld = renderer.worldFromScreen(mouse.x, mouse.y, { camera, zoom });
-  return {
-    move: input.move(),
-    sprint: input.sprint(),
-    aim: aimWorld,
-    fire: mouse.down,
-    use: false,
-    drive: input.drive(),
-  };
-}
+let last = performance.now();
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  const target = cameraTarget();
-  camera = target;
-  let painted = 0;
-  function paint() {
-    renderer.draw(buildView(), scene.screen, time);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  let last = performance.now();
-  let accumulator = 0;
-
-  function stepWorld() {
-    const base = frameInput();
-    const newGameKey = input.pressedCode('KeyN');
-    const actions = input.takeActions();
-    if (actions & ACTION_MUTE) {
-      const muted = audio.toggleMute();
-      world.showBanner(muted ? 'SOUND OFF' : 'SOUND ON', '', 1.2);
-    }
-    if (screen === SCREEN_TITLE) {
-      if (actions & ACTION_CONFIRM) {
-        startGame(hasSave());
-      } else if (newGameKey) {
-        startGame(false);
-      } else {
-        // The city lives behind the title.
-        world.step(STEP, { ...base, aim: { x: world.state.player.x + 100, y: world.state.player.y } }, null);
-      }
-      return;
-    }
-    if (screen === SCREEN_PAUSED) {
-      if (actions & (ACTION_PAUSE | ACTION_CONFIRM)) screen = SCREEN_PLAY;
-      if (actions & ACTION_SAVE) doSave();
-      return;
-    }
-    if (screen === SCREEN_WASTED) {
-      if (actions & ACTION_CONFIRM) {
-        world.respawnAfterWasted();
-        screen = SCREEN_PLAY;
-      }
-      return;
-    }
-    if (screen === SCREEN_BUSTED) {
-      if (actions & ACTION_CONFIRM) {
-        world.respawnAfterBusted();
-        screen = SCREEN_PLAY;
-      }
-      return;
-    }
-    if (screen === SCREEN_COMPLETE) {
-      if (actions & ACTION_CONFIRM) {
-        screen = SCREEN_PLAY;
-      }
-      return;
-    }
-    // Playing.
-    if (actions & ACTION_PAUSE) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-      return;
-    }
-    if (actions & ACTION_SAVE) doSave();
-    base.use = Boolean(actions & 2);
-    world.step(STEP, base, audio);
-    time += STEP;
-    if (world.state.wasted) {
-      screen = SCREEN_WASTED;
-      audio.busted();
-      if (world.state.player.money > bestTake) {
-        bestTake = world.state.player.money;
-        saveBestTake(bestTake);
-      }
-      announce('Wasted.');
-    } else if (world.state.busted) {
-      screen = SCREEN_BUSTED;
-      audio.busted();
-      announce('Busted.');
-    } else if (world.state.storyDone && !completeShown) {
-      completeShown = true;
-      screen = SCREEN_COMPLETE;
-      audio.missionDone();
-    }
-    const speed01 = world.state.player.car ? Math.abs(world.state.player.car.speed) / 560 : 0;
-    audio.engine(speed01, Boolean(world.state.player.car));
-    audio.siren(world.state.wanted.stars > 0);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    while (accumulator >= STEP) {
-      stepWorld();
-      accumulator -= STEP;
-    }
-    const target = cameraTarget();
-    camera.x += (target.x - camera.x) * 0.12;
-    camera.y += (target.y - camera.y) * 0.12;
-    renderer.draw(buildView(), screen, time);
-  }
-
-  announce('Porto Lumen. Press Enter to start.');
+function frame(now) {
   requestAnimationFrame(frame);
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05; // jepit: tab tidak aktif tidak melempar simulasi
+  if (dt <= 0) return;
+
+  // Tombol global yang bekerja di semua mode.
+  if (input.wasPressed('m')) {
+    S.muted = !S.muted;
+    sfx.setMuted(S.muted);
+  }
+
+  if (S.mode === 'title') {
+    if (input.wasClicked() || input.wasPressed('Enter') || input.wasPressed(' ')) {
+      startPlaying(false);
+    } else if (input.wasPressed('c') && hasSave()) {
+      startPlaying(true);
+    }
+  } else if (S.mode === 'playing') {
+    S.time += dt;
+    if (input.wasPressed('p') || input.wasPressed('Escape')) {
+      S.mode = 'paused';
+    } else {
+      if (input.wasPressed('e')) tryEnterExitCar(S, sfx);
+      if (input.wasPressed('q')) saveGame(S);
+      if (input.mouseDown || input.wasClicked()) playerShoot(S, input, S.cam, sfx);
+      if (S.player.fireCd > 0) S.player.fireCd -= dt;
+      updateCars(S, dt, input, sfx);
+      updatePeople(S, dt, input, S.cam, sfx);
+      updateBullets(S, dt, sfx);
+      updateCrates(S, sfx);
+      updateWanted(S, dt, sfx);
+      updateMissions(S, dt, input, sfx);
+      reapDead(S, sfx);
+      updateParticles(S, dt);
+      // Regenerasi darah perlahan saat tidak dikejar dan tidak terluka.
+      if (S.wanted === 0 && S.time - S.lastHurtAt > 5 && S.health > 0 && S.health < 100) {
+        S.health = Math.min(100, S.health + 2 * dt);
+      }
+      updateCamera();
+    }
+  } else if (S.mode === 'paused') {
+    if (input.wasPressed('p') || input.wasPressed('Escape')) S.mode = 'playing';
+  } else if (S.mode === 'over' || S.mode === 'win') {
+    if (input.wasClicked() || input.wasPressed('Enter') || input.wasPressed(' ')) {
+      restart();
+    }
+  }
+
+  render(ctx, S, hasSave());
+  window.__portoReady = true;
+  input.endFrame();
 }
 
-if (shot) runShot(shot);
-else runGame();
+// Adegan screenshot: ?shot=title|drive|chase|mission menata dunia lalu
+// membiarkannya berjalan (tangkapan diambil setelah ~1 detik).
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot');
+if (shot) {
+  setupShot(S, shot, sfx);
+  S.cam.x = clamp(S.player.x - VIEW_W / 2, 0, WORLD - VIEW_W);
+  S.cam.y = clamp(S.player.y - VIEW_H / 2, 0, WORLD - VIEW_H);
+}
+
+requestAnimationFrame(frame);

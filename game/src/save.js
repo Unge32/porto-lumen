@@ -1,34 +1,36 @@
-// Saving: one localStorage slot holds the whole career — money, ammo,
-// health, the mission reached, the player's spot and the best take.
-// A save never blocks the game: storage can be off and play goes on.
-import { SAVE_KEY, BEST_KEY } from './config.js';
+// Porto Lumen — simpan / muat lewat localStorage (tombol Q saat bermain).
+// Yang disimpan hanya progres: misi, uang, darah, amunisi, posisi, wanted.
+// Mobil dan lalu lintas dibangun ulang saat muat; itu disengaja supaya save
+// selalu konsisten.
 
-export function saveGame(state) {
+import { SAVE_KEY } from './config.js';
+
+export function saveGame(S) {
   try {
     const data = {
-      version: 1,
-      money: state.player.money,
-      ammo: state.player.ammo,
-      health: state.player.health,
-      missionIndex: state.missionIndex,
-      x: state.player.x,
-      y: state.player.y,
-      kills: state.kills,
-      savedAt: Date.now(),
+      mission: S.mission.index,
+      money: S.money,
+      health: S.health,
+      ammo: S.ammo,
+      x: S.player.x,
+      y: S.player.y,
+      wanted: S.wanted,
     };
-    window.localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+    S.message = 'Game saved';
+    S.messageAt = S.time;
     return true;
   } catch {
     return false;
   }
 }
 
-export function loadGame() {
+export function loadSave() {
   try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
+    const raw = localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    if (!data || data.version !== 1) return null;
+    if (typeof data.mission !== 'number') return null;
     return data;
   } catch {
     return null;
@@ -36,21 +38,20 @@ export function loadGame() {
 }
 
 export function hasSave() {
-  return loadGame() !== null;
+  return loadSave() !== null;
 }
 
-export function readBestTake() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
-}
-
-export function saveBestTake(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Best take is a nicety; a failed write changes nothing in play.
-  }
+export function applySave(S, data, startMission) {
+  S.money = data.money ?? 50;
+  S.health = data.health ?? 100;
+  S.ammo = data.ammo ?? 24;
+  S.player.x = data.x;
+  S.player.y = data.y;
+  S.player.onFoot = true;
+  S.player.car = null;
+  S.wanted = 0;
+  S.cam.x = data.x;
+  S.cam.y = data.y;
+  startMission(S, Math.min(data.mission, 4), null);
+  S.wanted = data.wanted ?? 0;
 }

@@ -1,292 +1,204 @@
-// Every car in Porto Lumen: the player's ride, the traffic that fills the
-// avenues, and the police cars that chase the player. Traffic follows the
-// road grid in its own lane and turns at intersections; police steer
-// straight at the player. All cars share one arcade driving model.
-import { CAR, PALETTE, SEA, WORLD } from './config.js';
+// Porto Lumen — kendaraan: fisika mengemudi, lalu lintas, dan kejar-kejaran.
+// Mobil pemain dikendalikan input; lalu lintas mengikuti jalan; polisi mengejar;
+// mobil bos kabur. Tabrakan dengan gedung dan antar mobil ditangani di sini.
 
-const LANE = 23;
+import { CAR_W, CAR_H, CAR_TOP_SPEED, CAR_ACCEL, CAR_BRAKE, CAR_TURN, WORLD, PITCH } from './config.js';
+import { clamp, dist, angleTo, turnToward } from './random.js';
+import { collideBuildings, nearestJunction } from './city.js';
+import { spawnParticles } from './world.js';
 
-export function makeCar(x, y, angle, color, kind) {
-  return {
-    x, y, angle, speed: 0, color, kind,
-    health: CAR.health, alive: true,
-    cruise: 0, lane: null, nextCross: 0,
-    siren: 0, stuck: 0,
-  };
-}
-
-function laneOffset(axis, dir) {
-  // Right-hand traffic: the lane sits on the right of the direction of travel.
-  if (axis === 'x') return dir * LANE;
-  return -dir * LANE;
-}
-
-function pickLane(random, roads, x, y) {
-  const vertical = random.chance(0.5);
-  const road = random.pick(roads);
-  const dir = random.chance(0.5) ? 1 : -1;
-  if (vertical) return { axis: 'y', road, dir };
-  return { axis: 'x', road, dir };
-}
-
-export function spawnTrafficCar(random, city, nearX, nearY) {
-  const point = city.roadPoint(random);
-  // Keep the spawn reasonably close to the action, not across the map.
-  const dx = point.x - nearX;
-  const dy = point.y - nearY;
-  if (Math.abs(dx) > 1300 || Math.abs(dy) > 1300) {
-    point.x = nearX + Math.max(-1200, Math.min(1200, dx * 0.4));
-    point.y = nearY + Math.max(-1200, Math.min(1200, dy * 0.4));
+// Dorong lingkaran keluar dari persegi gedung, dan jaga di dalam dunia.
+function resolveWalls(S, e, r) {
+  e.x = clamp(e.x, r, WORLD - r);
+  e.y = clamp(e.y, r, WORLD - r);
+  const hit = collideBuildings(S.city.buildings, e.x, e.y, r);
+  if (hit) {
+    e.x = hit.x;
+    e.y = hit.y;
+    return true;
   }
-  const lane = pickLane(random, city.roads, point.x, point.y);
-  const car = makeCar(point.x, point.y, lane.axis === 'x' ? (lane.dir > 0 ? 0 : Math.PI) : (lane.dir > 0 ? Math.PI / 2 : -Math.PI / 2), random.pick(PALETTE.carColors), 'traffic');
-  car.lane = lane;
-  car.cruise = random.range(130, 210);
-  car.speed = car.cruise * 0.6;
-  // Place it on its lane, not on the road centre.
-  if (lane.axis === 'x') car.y = lane.road + laneOffset('x', lane.dir);
-  else car.x = lane.road + laneOffset('y', lane.dir);
-  car.nextCross = nextIntersection(city, car);
-  return car;
+  return false;
 }
 
-function nextIntersection(city, car) {
-  const axis = car.lane.axis;
-  const along = axis === 'x' ? car.x : car.y;
-  const dir = car.lane.dir;
-  let best = null;
-  for (const road of city.roads) {
-    if (dir > 0 && road > along + 10 && (best === null || road < best)) best = road;
-    if (dir < 0 && road < along - 10 && (best === null || road > best)) best = road;
+// Satu langkah fisika mobil: gas, rem, belok, lalu geser dan tabrakan.
+function driveStep(S, car, dt, throttle, steer) {
+  const top = car.kind === 'police' ? CAR_TOP_SPEED * 1.08 : car.kind === 'boss' ? CAR_TOP_SPEED * 0.95 : CAR_TOP_SPEED;
+  if (throttle > 0) car.speed += CAR_ACCEL * throttle * dt;
+  else if (throttle < 0) car.speed += CAR_BRAKE * throttle * dt; // mundur / rem
+  else car.speed *= Math.pow(0.4, dt); // melambat sendiri
+  car.speed = clamp(car.speed, -140, top);
+  const steerPower = clamp(Math.abs(car.speed) / 120, 0, 1) * CAR_TURN;
+  car.angle += steer * steerPower * dt * (car.speed >= 0 ? 1 : -1);
+  const nx = car.x + Math.cos(car.angle) * car.speed * dt;
+  const ny = car.y + Math.sin(car.angle) * car.speed * dt;
+  car.x = nx;
+  car.y = ny;
+  if (resolveWalls(S, car, CAR_H / 2 + 4)) {
+    if (Math.abs(car.speed) > 180) spawnParticles(S, car.x, car.y, '#888888', 6, 120);
+    car.speed *= 0.4;
   }
-  return best === null ? along + dir * 300 : best;
 }
 
-// At an intersection the car usually goes straight, sometimes turns.
-// A cross beyond the last real road is a sentinel, not a road: going
-// straight there lets the car drive off and get recycled.
-function chooseTurn(random, car, cross, city) {
-  const roll = random.next();
-  const { axis, dir } = car.lane;
-  if (roll < 0.68 || !city.roads.includes(cross)) return car.lane;
-  if (axis === 'x') {
-    // Heading east (+x): left is north (-y), right is south (+y).
-    const turnLeft = roll < 0.84;
-    const newDir = dir > 0 ? (turnLeft ? -1 : 1) : (turnLeft ? 1 : -1);
-    return { axis: 'y', road: cross, dir: newDir };
-  }
-  // Heading south (+y): left is east (+x), right is west (-x).
-  const turnLeft = roll < 0.84;
-  const newDir = dir > 0 ? (turnLeft ? 1 : -1) : (turnLeft ? -1 : 1);
-  return { axis: 'x', road: cross, dir: newDir };
-}
-
-function angleToward(from, to) {
-  let diff = to - from;
-  while (diff > Math.PI) diff -= Math.PI * 2;
-  while (diff < -Math.PI) diff += Math.PI * 2;
-  return diff;
-}
-
-function steerToward(car, targetX, targetY, dt, turnRate) {
-  const want = Math.atan2(targetY - car.y, targetX - car.x);
-  const diff = angleToward(car.angle, want);
-  const step = Math.max(-turnRate * dt, Math.min(turnRate * dt, diff));
-  car.angle += step;
-}
-
-function speedAhead(car, others, lookAhead) {
-  let target = car.cruise;
-  const fx = Math.cos(car.angle);
-  const fy = Math.sin(car.angle);
-  for (const other of others) {
-    if (other === car || !other.alive) continue;
-    const dx = other.x - car.x;
-    const dy = other.y - car.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist > lookAhead || dist < 1) continue;
-    const ahead = (dx * fx + dy * fy) / dist;
-    if (ahead < 0.6) continue;
-    const gap = dist - 56;
-    target = Math.min(target, Math.max(0, gap * 2.4));
-  }
-  return target;
-}
-
-function pushOutOfBuildings(car, city, killSpeed = true) {
-  // Two circles, nose and tail, so a long car cannot clip a corner.
-  for (const sign of [1, -1]) {
-    const px = car.x + Math.cos(car.angle) * 20 * sign;
-    const py = car.y + Math.sin(car.angle) * 20 * sign;
-    const fixed = city.resolveCircle(px, py, 18);
-    const dx = fixed.x - px;
-    const dy = fixed.y - py;
-    if (dx !== 0 || dy !== 0) {
-      car.x += dx;
-      car.y += dy;
-      // Sliding along a wall beats a dead stop: killing the speed every
-      // frame while a turning car clips a corner wedges it at 0 forever.
-      if (killSpeed) car.speed *= 0.6;
-    }
-  }
-  if (car.y > SEA.y - 22) {
-    car.y = SEA.y - 22;
-    if (killSpeed) car.speed *= 0.5;
-  }
-  car.x = Math.max(24, Math.min(WORLD.size - 24, car.x));
-  car.y = Math.max(24, Math.min(WORLD.size - 24, car.y));
-}
-
-function separateCars(car, others) {
-  for (const other of others) {
-    if (other === car || !other.alive) continue;
-    const dx = car.x - other.x;
-    const dy = car.y - other.y;
-    const dist = Math.hypot(dx, dy);
-    const min = 52;
-    if (dist > 0.01 && dist < min) {
-      const push = (min - dist) / 2;
-      const nx = dx / dist;
-      const ny = dy / dist;
-      car.x += nx * push;
-      car.y += ny * push;
-      other.x -= nx * push;
-      other.y -= ny * push;
-      if (Math.abs(car.speed - other.speed) > 120) {
-        car.health -= 2;
-        other.health -= 2;
+// Tabrakan antar mobil: dorong berpisah, kurangi kecepatan, beri damage kecil
+// saat benturan keras (dipakai untuk merusak mobil bos dengan cara menabrak).
+function collideCars(S, dt) {
+  const cars = S.cars;
+  for (let i = 0; i < cars.length; i++) {
+    for (let j = i + 1; j < cars.length; j++) {
+      const a = cars[i];
+      const b = cars[j];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d = Math.hypot(dx, dy);
+      const min = 44;
+      if (d >= min || d === 0) continue;
+      const push = (min - d) / 2;
+      const nx = dx / d;
+      const ny = dy / d;
+      a.x -= nx * push;
+      a.y -= ny * push;
+      b.x += nx * push;
+      b.y += ny * push;
+      const rel = Math.abs(a.speed - b.speed);
+      if (rel > 160) {
+        if (a.kind === 'boss' || b.kind === 'boss') {
+          const boss = a.kind === 'boss' ? a : b;
+          boss.hp -= 12;
+          spawnParticles(S, boss.x, boss.y, '#ffaa33', 10, 200);
+        }
+        a.speed *= 0.6;
+        b.speed *= 0.6;
       }
     }
   }
 }
 
-export function updateTrafficCar(car, dt, city, random, allCars, playerPos) {
-  if (!car.alive) return;
-  const along = car.lane.axis === 'x' ? car.x : car.y;
-  const crossed = car.lane.dir > 0 ? along >= car.nextCross : along <= car.nextCross;
-  if (crossed) {
-    car.lane = chooseTurn(random, car, car.nextCross, city);
-    car.nextCross = nextIntersection(city, car);
+// AI lalu lintas: pilih persimpangan berikutnya, lalu ikuti jalan lurus.
+// Di persimpangan, 70% lurus, sisanya belok kiri/kanan.
+function trafficAI(S, car, dt) {
+  if (!car.wp) {
+    const [jx, jy] = nearestJunction(car.x, car.y);
+    car.wp = [jx, jy];
   }
-  const off = laneOffset(car.lane.axis, car.lane.dir);
-  let targetX;
-  let targetY;
-  if (car.lane.axis === 'x') {
-    targetX = car.x + car.lane.dir * 140;
-    targetY = car.lane.road + off;
+  const [wx, wy] = car.wp;
+  const d = dist(car.x, car.y, wx, wy);
+  if (d < 26) {
+    // Sampai di persimpangan: pilih arah baru.
+    const r = Math.random();
+    const dirs = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
+    let next = car.wpAngle;
+    if (r < 0.7) {
+      next = car.wpAngle; // lurus
+    } else if (r < 0.85) {
+      next = car.wpAngle + Math.PI / 2; // kiri
+    } else {
+      next = car.wpAngle - Math.PI / 2; // kanan
+    }
+    const jx = car.wp[0] + Math.cos(next) * PITCH;
+    const jy = car.wp[1] + Math.sin(next) * PITCH;
+    if (jx > 40 && jx < WORLD - 40 && jy > 40 && jy < WORLD - 40) {
+      car.wp = [jx, jy];
+      car.wpAngle = next;
+    } else {
+      // Ujung kota: putar balik.
+      car.wpAngle = next + Math.PI;
+      car.wp = [car.wp[0] + Math.cos(car.wpAngle) * PITCH, car.wp[1] + Math.sin(car.wpAngle) * PITCH];
+    }
+    return;
+  }
+  const target = angleTo(car.x, car.y, wx, wy);
+  car.angle = turnToward(car.angle, target, 2.2 * dt);
+  // Pelan-pelan di tikungan tajam, ngebut di jalan lurus.
+  const want = Math.abs(((target - car.angle + Math.PI * 3) % (Math.PI * 2)) - Math.PI) > 0.6 ? 60 : 110;
+  car.speed += clamp(want - car.speed, -160 * dt, 90 * dt);
+  driveStep(S, car, dt, 0, 0);
+}
+
+// AI polisi: kejar pemain (atau mobilnya), tabrak untuk menghentikan.
+function policeAI(S, car, dt) {
+  const p = S.player;
+  const target = angleTo(car.x, car.y, p.x, p.y);
+  car.angle = turnToward(car.angle, target, 3.1 * dt);
+  car.speed += clamp(CAR_TOP_SPEED * 1.05 - car.speed, -260 * dt, 300 * dt);
+  driveStep(S, car, dt, 0, 0);
+  // Menabrak pemain (jalan kaki atau mobil) memberi damage.
+  const d = dist(car.x, car.y, p.x, p.y);
+  if (d < 46) {
+    hurtPlayer(S, car.kind === 'police' ? 12 : 6);
+    car.speed *= 0.5;
+    spawnParticles(S, p.x, p.y, '#ff5555', 5, 140);
+  }
+}
+
+// AI bos: kabur dari pemain lewat jalan, sesekali belok di persimpangan.
+function bossAI(S, car, dt) {
+  const p = S.player;
+  if (!car.wp || dist(car.x, car.y, car.wp[0], car.wp[1]) < 30) {
+    const away = angleTo(p.x, p.y, car.x, car.y);
+    const [jx, jy] = nearestJunction(car.x, car.y);
+    const dirs = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
+    let best = dirs[0];
+    let bestScore = -1e9;
+    for (const dir of dirs) {
+      const nx = jx + Math.cos(dir) * PITCH;
+      const ny = jy + Math.sin(dir) * PITCH;
+      if (nx < 40 || nx > WORLD - 40 || ny < 40 || ny > WORLD - 40) continue;
+      const score = Math.cos(dir - away) + Math.random() * 0.4;
+      if (score > bestScore) {
+        bestScore = score;
+        best = dir;
+      }
+    }
+    car.wp = [jx + Math.cos(best) * PITCH, jy + Math.sin(best) * PITCH];
+  }
+  const target = angleTo(car.x, car.y, car.wp[0], car.wp[1]);
+  car.angle = turnToward(car.angle, target, 2.6 * dt);
+  car.speed += clamp(CAR_TOP_SPEED * 0.92 - car.speed, -200 * dt, 260 * dt);
+  driveStep(S, car, dt, 0, 0);
+}
+
+function hurtPlayer(S, amount) {
+  if (S.mode !== 'playing' || S.player.dead) return;
+  S.health -= amount;
+  S.lastHurtAt = S.time;
+  if (S.health <= 0) {
+    S.health = 0;
+    S.player.dead = true;
+    S.mode = 'over';
+  }
+}
+
+export function updateCars(S, dt, input, sfx) {
+  const p = S.player;
+  // Mobil pemain: kendali dari input.
+  if (!p.onFoot && p.car) {
+    const car = p.car;
+    const throttle = input.down('w', 'ArrowUp') ? 1 : input.down('s', 'ArrowDown') ? -1 : 0;
+    const steer = input.down('a', 'ArrowLeft') ? -1 : input.down('d', 'ArrowRight') ? 1 : 0;
+    driveStep(S, car, dt, throttle, steer);
+    p.x = car.x;
+    p.y = car.y;
+    p.angle = car.angle;
+    sfx.engine(Math.abs(car.speed) / CAR_TOP_SPEED);
   } else {
-    targetX = car.lane.road + off;
-    targetY = car.y + car.lane.dir * 140;
+    sfx.engine(0);
   }
-  steerToward(car, targetX, targetY, dt, 2.2);
-  const wantSpeed = speedAhead(car, allCars, 120);
-  car.speed += Math.max(-260 * dt, Math.min(200 * dt, wantSpeed - car.speed));
-  car.x += Math.cos(car.angle) * car.speed * dt;
-  car.y += Math.sin(car.angle) * car.speed * dt;
-  pushOutOfBuildings(car, city, false);
-  separateCars(car, allCars);
-  // Safety net: a car wedged below a crawl for seconds gets recycled
-  // near the player instead of sitting dead on the road forever.
-  if (car.speed < 10) car.stuck += dt;
-  else car.stuck = 0;
-  // Far from the action, recycle the car near the player instead.
-  const dx = car.x - playerPos.x;
-  const dy = car.y - playerPos.y;
-  if (Math.abs(dx) > 1700 || Math.abs(dy) > 1700 || car.stuck > 3) {
-    const fresh = spawnTrafficCar(random, city, playerPos.x, playerPos.y);
-    car.x = fresh.x;
-    car.y = fresh.y;
-    car.angle = fresh.angle;
-    car.lane = fresh.lane;
-    car.nextCross = fresh.nextCross;
-    car.cruise = fresh.cruise;
-    car.speed = fresh.cruise * 0.6;
-    car.color = fresh.color;
-    car.health = CAR.health;
-    car.stuck = 0;
+  for (const car of S.cars) {
+    if (car === p.car) continue;
+    if (car.kind === 'traffic') trafficAI(S, car, dt);
+    else if (car.kind === 'police') policeAI(S, car, dt);
+    else if (car.kind === 'boss') bossAI(S, car, dt);
+    // 'parked' diam di tempat.
   }
-}
-
-export function updatePoliceCar(car, dt, city, target, allCars) {
-  if (!car.alive) return;
-  car.siren += dt;
-  const dist = Math.hypot(target.x - car.x, target.y - car.y);
-  if (dist < 70) {
-    // Bumper to bumper: push the target, do not drive through it.
-    car.speed = Math.max(0, car.speed - 500 * dt);
-  } else {
-    steerToward(car, target.x, target.y, dt, 3.1);
-    car.speed += Math.max(-300 * dt, Math.min(320 * dt, 520 - car.speed));
-  }
-  car.x += Math.cos(car.angle) * car.speed * dt;
-  car.y += Math.sin(car.angle) * car.speed * dt;
-  pushOutOfBuildings(car, city, false);
-  separateCars(car, allCars);
-  if (dist > 1900) car.alive = false;
-}
-
-// The player's own driving: throttle, brake/reverse, steering that only
-// bites while moving, and a handbrake that lets the tail step out.
-export function drivePlayerCar(car, drive, dt, city) {
-  if (!car.alive) return;
-  if (drive.throttle) car.speed += CAR.accel * dt;
-  if (drive.brake) {
-    if (car.speed > 20) car.speed -= CAR.brake * dt;
-    else car.speed -= CAR.reverseAccel * dt;
-  }
-  if (!drive.throttle && !drive.brake) {
-    car.speed -= Math.sign(car.speed) * Math.min(Math.abs(car.speed), 160 * dt);
-  }
-  car.speed = Math.max(-CAR.maxReverse, Math.min(CAR.maxSpeed, car.speed));
-  const turnAuthority = Math.max(0, Math.min(1, Math.abs(car.speed) / 160));
-  const turnRate = CAR.steer * turnAuthority * (drive.handbrake ? 1.5 : 1);
-  car.angle += drive.steer * turnRate * Math.sign(car.speed || 1) * dt;
-  car.x += Math.cos(car.angle) * car.speed * dt;
-  car.y += Math.sin(car.angle) * car.speed * dt;
-  pushOutOfBuildings(car, city, false);
-}
-
-export function spawnPoliceCar(random, city, nearX, nearY) {
-  const angle = random.range(0, Math.PI * 2);
-  const dist = random.range(650, 950);
-  const point = city.roadPoint(random);
-  const car = makeCar(point.x, point.y, angle, PALETTE.police, 'police');
-  car.cruise = 520;
-  car.speed = 300;
-  // Nudge the spawn onto a road near the player, not across the map.
-  car.x = nearX + Math.cos(angle) * dist;
-  car.y = nearY + Math.sin(angle) * dist;
-  const fixed = city.resolveCircle(car.x, car.y, 30);
-  car.x = fixed.x;
-  car.y = fixed.y;
-  return car;
-}
-
-export function nearestCar(cars, x, y, maxDist) {
-  let best = null;
-  let bestDist = maxDist;
-  for (const car of cars) {
-    if (!car.alive) continue;
-    const dist = Math.hypot(car.x - x, car.y - y);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = car;
+  collideCars(S, dt);
+  // Mobil bos yang hancur: asap + ledakan kecil, lalu hilang dari jalan.
+  for (const car of [...S.cars]) {
+    if (car.kind === 'boss' && car.hp <= 0 && !S.mission.bossWrecked) {
+      S.mission.bossWrecked = true;
+      spawnParticles(S, car.x, car.y, '#ff8800', 26, 260);
+      spawnParticles(S, car.x, car.y, '#555555', 18, 120);
+      sfx.crash();
+      S.cars = S.cars.filter((c) => c !== car);
     }
   }
-  return best;
-}
-
-// Give a car a fresh lane from where it stands, so a car the player
-// abandons rejoins the traffic instead of driving off the grid.
-export function assignLane(car, city) {
-  const distX = Math.abs(car.x - city.nearestRoad(car.x));
-  const distY = Math.abs(car.y - city.nearestRoad(car.y));
-  if (distX < distY) {
-    const dir = Math.cos(car.angle) >= 0 ? 1 : -1;
-    car.lane = { axis: 'y', road: city.nearestRoad(car.x), dir };
-  } else {
-    const dir = Math.sin(car.angle) >= 0 ? 1 : -1;
-    car.lane = { axis: 'x', road: city.nearestRoad(car.y), dir };
-  }
-  car.nextCross = nextIntersection(city, car);
 }

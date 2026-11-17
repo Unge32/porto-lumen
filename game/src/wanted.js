@@ -1,58 +1,57 @@
-// The wanted level: stars the player earns by committing crimes in the
-// open, and the police response they buy. Heat fades when the player
-// keeps quiet and out of sight; the law never forgets a fresh crime.
-import { WANTED } from './config.js';
+// Porto Lumen — wanted level: naik saat berbuat kriminal, turun saat
+// bersembunyi, dan jumlah polisi yang dikerahkan mengikuti levelnya.
 
-export function createWanted() {
-  return {
-    stars: 0,
-    decayTimer: 0,
-    dispatchTimer: 0,
-    bustTimer: 0,
-  };
+import { dist } from './random.js';
+import { spawnPoliceCar, spawnFootCop } from './world.js';
+
+// Kejahatan: naikkan wanted, catat waktunya.
+export function addWanted(S, n) {
+  S.wanted = Math.min(5, S.wanted + n);
+  S.lastCrimeAt = S.time;
 }
 
-export function addCrime(wanted, stars) {
-  if (stars <= 0) return;
-  wanted.stars = Math.min(WANTED.maxStars, wanted.stars + stars);
-  wanted.decayTimer = WANTED.decayDelay;
-}
+export function updateWanted(S, dt, sfx) {
+  // Turun perlahan bila sudah lama tidak berbuat kriminal dan tidak ada
+  // polisi yang dekat.
+  if (S.wanted > 0 && S.time - S.lastCrimeAt > 20) {
+    let policeNear = false;
+    for (const car of S.cars) {
+      if (car.kind === 'police' && dist(car.x, car.y, S.player.x, S.player.y) < 600) {
+        policeNear = true;
+        break;
+      }
+    }
+    if (!policeNear) {
+      S.heatTimer += dt;
+      if (S.heatTimer > 8) {
+        S.heatTimer = 0;
+        S.wanted--;
+      }
+    } else {
+      S.heatTimer = 0;
+    }
+  } else {
+    S.heatTimer = 0;
+  }
 
-export function updateWanted(wanted, dt, policeNear, policeCars, footPolice, spawnPoliceCar, spawnFootPolice, playerPos, random, city) {
-  // No crime for a while and no police in sight: the heat cools, one star
-  // at a time, faster at one star than at five.
-  if (wanted.stars > 0) {
-    wanted.decayTimer -= dt;
-    if (wanted.decayTimer <= 0 && !policeNear) {
-      wanted.stars -= 1;
-      wanted.decayTimer = WANTED.decayInterval;
-      if (wanted.stars === 0) {
-        for (const car of policeCars) car.alive = false;
-        footPolice.length = 0;
+  // Kerahkan polisi sesuai level: mobil polisi + polisi jalan kaki.
+  const wantCars = Math.min(S.wanted, 4);
+  const wantCops = S.wanted >= 2 ? Math.min(S.wanted - 1, 3) : 0;
+  const haveCars = S.cars.filter((c) => c.kind === 'police').length;
+  const haveCops = S.peds.filter((p) => p.kind === 'cop').length;
+  if (haveCars < wantCars) spawnPoliceCar(S);
+  if (haveCops < wantCops) spawnFootCop(S);
+  // Wanted 0: polisi pulang (mobil menjauh, pejalan kaki kembali jadi warga).
+  if (S.wanted === 0) {
+    S.cars = S.cars.filter((c) => {
+      if (c.kind !== 'police') return true;
+      return dist(c.x, c.y, S.player.x, S.player.y) < 500;
+    });
+    for (const ped of S.peds) {
+      if (ped.kind === 'cop' && dist(ped.x, ped.y, S.player.x, S.player.y) > 500) {
+        ped.kind = 'civilian';
       }
     }
   }
-  if (wanted.stars === 0) return;
-  // Keep the right number of police cars hunting.
-  wanted.dispatchTimer -= dt;
-  const wantCars = WANTED.policeCars[wanted.stars] || 0;
-  const aliveCars = policeCars.filter((c) => c.alive).length;
-  if (wanted.dispatchTimer <= 0 && aliveCars < wantCars) {
-    policeCars.push(spawnPoliceCar(random, city, playerPos.x, playerPos.y));
-    wanted.dispatchTimer = 2.5;
-  }
-  // Foot officers only matter when the player is walking.
-  const wantFoot = WANTED.policeFoot[wanted.stars] || 0;
-  if (wanted.dispatchTimer <= 0 && footPolice.length < wantFoot && playerPos.onFoot) {
-    const angle = random.range(0, Math.PI * 2);
-    footPolice.push(spawnFootPolice(playerPos.x + Math.cos(angle) * 420, playerPos.y + Math.sin(angle) * 420));
-    wanted.dispatchTimer = 2.5;
-  }
-}
-
-export function clearWanted(wanted, policeCars, footPolice) {
-  wanted.stars = 0;
-  wanted.decayTimer = 0;
-  for (const car of policeCars) car.alive = false;
-  footPolice.length = 0;
+  sfx.siren(dt, S.wanted);
 }

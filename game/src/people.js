@@ -1,184 +1,147 @@
-// Everyone on foot: the player, the pedestrians filling the sidewalks,
-// the foot police who chase a wanted player, and the rival gang members
-// who only show up when a mission calls them.
-import { PLAYER, PED, WORLD, BEACH } from './config.js';
+// Porto Lumen — orang: pejalan kaki, polisi jalan kaki, dan geng Viper,
+// plus gerakan pemain saat jalan kaki. Warga menghindar dari bahaya; polisi
+// dan Viper mengejar dan menembak pemain.
 
-const SHIRT_COLORS = ['#e8e8e8', '#d94f3d', '#3d7bd9', '#e8c33d', '#3da67a', '#7a4fd9', '#2b2b33', '#d97b2f', '#e8a0b4'];
-const SKIN_COLORS = ['#f0c8a0', '#c98d5f', '#8d5a3b', '#e8b88a'];
+import { PLAYER_R, PLAYER_SPEED, WORLD, BULLET_SPEED, ENEMY_BULLET_DAMAGE, PITCH, BLOCKS } from './config.js';
+import { clamp, dist, angleTo, turnToward, rand } from './random.js';
+import { collideBuildings, isRoadAt } from './city.js';
+import { spawnParticles } from './world.js';
 
-export function makePlayer(x, y) {
-  return {
-    x, y, angle: -Math.PI / 2, health: PLAYER.health, ammo: PLAYER.startAmmo,
-    money: 150, onFoot: true, car: null, fireCooldown: 0, hurtTimer: 0,
-    walkCycle: 0, moving: false,
-  };
-}
-
-export function updatePlayer(player, move, sprint, aimAngle, dt, city, cars) {
-  const speed = sprint ? PLAYER.sprintSpeed : PLAYER.walkSpeed;
-  player.moving = move.x !== 0 || move.y !== 0;
-  if (player.moving) {
-    player.x += move.x * speed * dt;
-    player.y += move.y * speed * dt;
-    player.walkCycle += dt * (sprint ? 11 : 8);
-  }
-  player.angle = aimAngle;
-  if (player.fireCooldown > 0) player.fireCooldown -= dt;
-  if (player.hurtTimer > 0) player.hurtTimer -= dt;
-  const fixed = city.resolveCircle(player.x, player.y, PLAYER.radius);
-  player.x = fixed.x;
-  player.y = fixed.y;
-  // Cars are solid to a pedestrian: get pushed out of their circle.
-  for (const car of cars) {
-    if (!car.alive) continue;
-    const dx = player.x - car.x;
-    const dy = player.y - car.y;
-    const dist = Math.hypot(dx, dy);
-    const min = PLAYER.radius + 26;
-    if (dist > 0.01 && dist < min) {
-      player.x = car.x + (dx / dist) * min;
-      player.y = car.y + (dy / dist) * min;
-    }
+function hurtPlayer(S, amount) {
+  if (S.mode !== 'playing' || S.player.dead) return;
+  S.health -= amount;
+  S.lastHurtAt = S.time;
+  if (S.health <= 0) {
+    S.health = 0;
+    S.player.dead = true;
+    S.mode = 'over';
   }
 }
 
-export function spawnPed(random, city) {
-  const point = city.sidewalkPoint(random);
-  const vertical = random.chance(0.5);
-  const ped = {
-    x: point.x, y: point.y, angle: 0,
-    speed: random.range(PED.walkSpeed * 0.7, PED.walkSpeed * 1.3),
-    state: 'walk', panic: 0, down: false,
-    shirt: random.pick(SHIRT_COLORS), skin: random.pick(SKIN_COLORS),
-    axis: vertical ? 'y' : 'x', road: vertical ? point.x : point.y,
-    side: 1, dir: random.chance(0.5) ? 1 : -1,
-    walkCycle: random.range(0, 6),
-  };
-  // The sidewalk point already fixed the road and side for us.
-  if (vertical) {
-    ped.road = city.nearestRoad(point.x);
-    ped.side = point.x > ped.road ? 1 : -1;
-  } else {
-    ped.road = city.nearestRoad(point.y);
-    ped.side = point.y > ped.road ? 1 : -1;
+// Gerakan pemain jalan kaki: WASD, hadap ke arah mouse, tabrakan gedung.
+export function updatePlayerOnFoot(S, dt, input, cam) {
+  const p = S.player;
+  let mx = 0;
+  let my = 0;
+  if (input.down('w', 'ArrowUp')) my -= 1;
+  if (input.down('s', 'ArrowDown')) my += 1;
+  if (input.down('a', 'ArrowLeft')) mx -= 1;
+  if (input.down('d', 'ArrowRight')) mx += 1;
+  if (mx !== 0 || my !== 0) {
+    const len = Math.hypot(mx, my);
+    p.x += (mx / len) * PLAYER_SPEED * dt;
+    p.y += (my / len) * PLAYER_SPEED * dt;
   }
-  return ped;
+  p.x = clamp(p.x, PLAYER_R, WORLD - PLAYER_R);
+  p.y = clamp(p.y, PLAYER_R, WORLD - PLAYER_R);
+  const hit = collideBuildings(S.city.buildings, p.x, p.y, PLAYER_R);
+  if (hit) {
+    p.x = hit.x;
+    p.y = hit.y;
+  }
+  // Arah hadap mengikuti mouse (posisi layar -> posisi dunia).
+  const wx = cam.x + input.mouseX;
+  const wy = cam.y + input.mouseY;
+  p.angle = angleTo(p.x, p.y, wx, wy);
 }
 
-function pedLanePos(ped) {
-  const offset = 92 / 2 + 8;
-  if (ped.axis === 'x') return { x: ped.x, y: ped.road + ped.side * offset };
-  return { x: ped.road + ped.side * offset, y: ped.y };
+// Warga: jalan santai di trotoar, belok di persimpangan; lari saat ada
+// tembakan atau mobil polisi melaju ke arahnya.
+function civilianAI(S, ped, dt) {
+  if (ped.fleeing) {
+    ped.wanderCd -= dt;
+    if (ped.wanderCd <= 0) ped.fleeing = false;
+  }
+  ped.wanderCd -= dt;
+  if (ped.wanderCd <= 0) {
+    ped.wanderCd = 2 + Math.random() * 3;
+    ped.targetAngle = Math.floor(Math.random() * 4) * (Math.PI / 2);
+  }
+  const speed = ped.fleeing ? 150 : 55;
+  ped.angle = turnToward(ped.angle, ped.targetAngle, 3 * dt);
+  ped.x += Math.cos(ped.angle) * speed * dt;
+  ped.y += Math.sin(ped.angle) * speed * dt;
+  // Tetap di jalan: kalau masuk blok, putar balik.
+  if (!isRoadAt(ped.x, ped.y)) {
+    ped.angle += Math.PI;
+    ped.x += Math.cos(ped.angle) * speed * dt * 2;
+    ped.y += Math.sin(ped.angle) * speed * dt * 2;
+  }
+  ped.x = clamp(ped.x, 20, WORLD - 20);
+  ped.y = clamp(ped.y, 20, WORLD - 20);
 }
 
-export function updatePed(ped, dt, city, random, threat) {
-  if (ped.down) return;
-  if (threat) {
-    const dist = Math.hypot(ped.x - threat.x, ped.y - threat.y);
-    if (dist < 420) {
-      ped.panic = 2.5;
-      ped.state = 'flee';
-    }
+// Polisi jalan kaki dan Viper: kejar pemain, tembak saat cukup dekat.
+function hunterAI(S, ped, dt, sfx) {
+  const p = S.player;
+  const d = dist(ped.x, ped.y, p.x, p.y);
+  const target = angleTo(ped.x, ped.y, p.x, p.y);
+  ped.angle = turnToward(ped.angle, target, 4 * dt);
+  const speed = ped.kind === 'viper' ? 165 : 150;
+  if (d > 240) {
+    ped.x += Math.cos(ped.angle) * speed * dt;
+    ped.y += Math.sin(ped.angle) * speed * dt;
   }
-  if (ped.panic > 0) {
-    ped.panic -= dt;
-    if (ped.panic <= 0) ped.state = 'walk';
+  const hit = collideBuildings(S.city.buildings, ped.x, ped.y, PLAYER_R);
+  if (hit) {
+    ped.x = hit.x;
+    ped.y = hit.y;
   }
-  if (ped.state === 'flee' && threat) {
-    const away = Math.atan2(ped.y - threat.y, ped.x - threat.x);
-    ped.angle = away;
-    ped.x += Math.cos(away) * PED.fleeSpeed * dt;
-    ped.y += Math.sin(away) * PED.fleeSpeed * dt;
-    ped.walkCycle += dt * 11;
-  } else {
-    const speed = ped.speed;
-    if (ped.axis === 'x') {
-      ped.x += ped.dir * speed * dt;
-      ped.angle = ped.dir > 0 ? 0 : Math.PI;
-    } else {
-      ped.y += ped.dir * speed * dt;
-      ped.angle = ped.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
-    }
-    ped.walkCycle += dt * 7;
-    // At an intersection, sometimes turn onto the crossing avenue.
-    const along = ped.axis === 'x' ? ped.x : ped.y;
-    const nearest = city.nearestRoad(along);
-    if (Math.abs(along - nearest) < speed * dt + 1 && random.chance(0.35)) {
-      if (ped.axis === 'x') {
-        ped.axis = 'y';
-        ped.road = nearest;
-        ped.side = ped.y > nearest ? 1 : -1;
-        ped.dir = random.chance(0.5) ? 1 : -1;
-      } else {
-        ped.axis = 'x';
-        ped.road = nearest;
-        ped.side = ped.x > nearest ? 1 : -1;
-        ped.dir = random.chance(0.5) ? 1 : -1;
+  ped.x = clamp(ped.x, 20, WORLD - 20);
+  ped.y = clamp(ped.y, 20, WORLD - 20);
+  // Tembak pemain saat dalam jangkauan dan terlihat.
+  ped.shootCd -= dt;
+  if (d < 340 && ped.shootCd <= 0 && S.mode === 'playing' && !p.dead) {
+    ped.shootCd = 0.9 + Math.random() * 0.7;
+    const spread = (Math.random() - 0.5) * 0.35;
+    const a = target + spread;
+    S.bullets.push({
+      x: ped.x + Math.cos(a) * 20,
+      y: ped.y + Math.sin(a) * 20,
+      vx: Math.cos(a) * BULLET_SPEED * 0.8,
+      vy: Math.sin(a) * BULLET_SPEED * 0.8,
+      life: 1.1,
+      from: 'enemy',
+      damage: ENEMY_BULLET_DAMAGE,
+    });
+    sfx.enemyShot();
+  }
+  // Sentuhan langsung juga melukai (10 hp per detik selama menempel).
+  if (d < 30) hurtPlayer(S, 10 * dt);
+}
+
+export function updatePeople(S, dt, input, cam, sfx) {
+  const p = S.player;
+  if (p.onFoot && !p.dead && S.mode === 'playing') updatePlayerOnFoot(S, dt, input, cam);
+  for (const ped of S.peds) {
+    if (ped.kind === 'civilian') civilianAI(S, ped, dt);
+    else hunterAI(S, ped, dt, sfx);
+  }
+  // Warga yang melihat tembakan di dekatnya akan lari.
+  for (const ped of S.peds) {
+    if (ped.kind !== 'civilian') continue;
+    for (const b of S.bullets) {
+      if (dist(ped.x, ped.y, b.x, b.y) < 160) {
+        ped.fleeing = true;
+        ped.wanderCd = 2;
+        ped.targetAngle = angleTo(b.x, b.y, ped.x, ped.y);
+        break;
       }
     }
-    // Turn around at the world's edge or the beach.
-    if (ped.x < 100 || ped.x > WORLD.size - 100 || ped.y < 100 || ped.y > BEACH.y - 60) {
-      ped.dir *= -1;
+  }
+}
+
+// Semua warga/polisi/Viper yang mati dihapus; pemain dapat skornya.
+export function reapDead(S, sfx) {
+  for (const ped of [...S.peds]) {
+    if (ped.hp > 0) continue;
+    spawnParticles(S, ped.x, ped.y, '#ff4444', 12, 180);
+    if (ped.kind === 'viper') {
+      S.stats.kills++;
+      S.money += 100;
+      S.mission.vipersLeft = Math.max(0, S.mission.vipersLeft - 1);
     }
+    if (ped.kind === 'cop') S.stats.kills++;
+    S.peds = S.peds.filter((q) => q !== ped);
   }
-  const fixed = city.resolveCircle(ped.x, ped.y, PED.radius);
-  ped.x = fixed.x;
-  ped.y = fixed.y;
-}
-
-export function makeEnemy(x, y) {
-  return {
-    x, y, angle: 0, health: 68, speed: 132, fireCooldown: 1.2,
-    shirt: '#3a3a44', skin: '#c98d5f', state: 'hunt', walkCycle: 0,
-  };
-}
-
-export function updateEnemy(enemy, dt, player, city, shoot) {
-  if (enemy.health <= 0) return;
-  const dx = player.x - enemy.x;
-  const dy = player.y - enemy.y;
-  const dist = Math.hypot(dx, dy);
-  enemy.angle = Math.atan2(dy, dx);
-  if (dist > 260) {
-    enemy.x += (dx / dist) * enemy.speed * dt;
-    enemy.y += (dy / dist) * enemy.speed * dt;
-    enemy.walkCycle += dt * 9;
-  } else if (dist < 120) {
-    enemy.x -= (dx / dist) * enemy.speed * 0.5 * dt;
-    enemy.y -= (dy / dist) * enemy.speed * 0.5 * dt;
-  }
-  enemy.fireCooldown -= dt;
-  if (enemy.fireCooldown <= 0 && dist < 460 && player.onFoot) {
-    enemy.fireCooldown = 0.95 + Math.random() * 0.5;
-    shoot(enemy.x, enemy.y, enemy.angle + (Math.random() - 0.5) * 0.24, 520, 8, false);
-  }
-  const fixed = city.resolveCircle(enemy.x, enemy.y, PED.radius);
-  enemy.x = fixed.x;
-  enemy.y = fixed.y;
-}
-
-export function makeFootPolice(x, y) {
-  return {
-    x, y, angle: 0, speed: 235, bust: 0,
-    shirt: '#1d4ed8', skin: '#f0c8a0', walkCycle: 0,
-  };
-}
-
-export function updateFootPolice(officer, dt, player, city) {
-  const dx = player.x - officer.x;
-  const dy = player.y - officer.y;
-  const dist = Math.hypot(dx, dy);
-  officer.angle = Math.atan2(dy, dx);
-  if (dist > 34) {
-    officer.x += (dx / dist) * officer.speed * dt;
-    officer.y += (dy / dist) * officer.speed * dt;
-    officer.walkCycle += dt * 10;
-    officer.bust = Math.max(0, officer.bust - dt);
-  } else {
-    officer.bust += dt;
-  }
-  const fixed = city.resolveCircle(officer.x, officer.y, PED.radius);
-  officer.x = fixed.x;
-  officer.y = fixed.y;
-  return officer.bust;
 }
