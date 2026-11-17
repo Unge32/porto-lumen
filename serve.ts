@@ -1,51 +1,46 @@
-// A tiny static file server for local playtesting (Node 22, standard
-// library only). It serves the game/ folder on http://localhost:8080 so
-// the game can be played in a desktop browser with no build step.
-// Usage: node serve.ts [--port 8080]
-import { readFile, stat } from 'node:fs/promises';
+// Porto Lumen — peladen statis kecil untuk main lokal (Node 22, pustaka standar saja).
+// Melayani folder game/ di http://localhost:8080 lalu membukanya di browser.
+// Jalankan dari root repo:  node serve.ts
+
 import { createServer } from 'node:http';
-import { extname, join, resolve, sep } from 'node:path';
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { join, extname, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(fileURLToPath(new URL('./game', import.meta.url)));
-const portArg = process.argv.indexOf('--port');
-const port = portArg === -1 ? 8080 : Number(process.argv[portArg + 1]) || 8080;
+const akarRepo = fileURLToPath(new URL('.', import.meta.url));
+const folderGame = join(akarRepo, 'game');
+const port = 8080;
 
-const types = new Map([
-  ['.html', 'text/html; charset=utf-8'],
-  ['.js', 'text/javascript; charset=utf-8'],
-  ['.mjs', 'text/javascript; charset=utf-8'],
-  ['.css', 'text/css; charset=utf-8'],
-  ['.json', 'application/json; charset=utf-8'],
-  ['.png', 'image/png'],
-  ['.jpg', 'image/jpeg'],
-  ['.jpeg', 'image/jpeg'],
-  ['.svg', 'image/svg+xml'],
-  ['.wav', 'audio/wav'],
-]);
+// Jenis konten yang dikenali berdasarkan akhiran nama berkas.
+const jenisKonten = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+};
 
-createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    let path = decodeURIComponent(url.pathname);
-    if (path.endsWith('/')) path += 'index.html';
-    const file = resolve(join(root, path));
-    if (file !== root && !file.startsWith(root + sep)) {
-      res.writeHead(403).end('forbidden');
-      return;
-    }
-    const info = await stat(file);
-    if (!info.isFile()) throw new Error('not a file');
-    const body = await readFile(file);
-    res.writeHead(200, {
-      'content-type': types.get(extname(file).toLowerCase()) ?? 'application/octet-stream',
-      'content-length': body.length,
-      'cache-control': 'no-store',
-    });
-    res.end(body);
-  } catch {
-    res.writeHead(404).end('not found');
+const peladen = createServer((permintaan, jawaban) => {
+  const alamat = new URL(permintaan.url ?? '/', 'http://localhost');
+  let jalur = alamat.pathname === '/' ? 'index.html' : alamat.pathname.slice(1);
+  jalur = normalize(jalur).replace(/^(\.\.[/\\])+/, '');
+  const berkas = join(folderGame, jalur);
+  if (!berkas.startsWith(folderGame) || !existsSync(berkas) || !statSync(berkas).isFile()) {
+    jawaban.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+    jawaban.end('Tidak ditemukan: ' + alamat.pathname);
+    return;
   }
-}).listen(port, '127.0.0.1', () => {
-  console.log(`Porto Lumen is on http://localhost:${port}`);
+  const akhiran = extname(berkas).toLowerCase();
+  jawaban.writeHead(200, { 'content-type': jenisKonten[akhiran] ?? 'application/octet-stream' });
+  jawaban.end(readFileSync(berkas));
+});
+
+peladen.listen(port, () => {
+  console.log(`Porto Lumen tersaji di http://localhost:${port}`);
 });

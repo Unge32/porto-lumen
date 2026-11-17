@@ -6,46 +6,19 @@ Entry for [make.fun's "Make GTA 6" bounty](https://make.fun/bounty/gta6-01) ($16
 
 # Porto Lumen — an open-world crime story
 
-Dario Venn is broke in a sun-soaked coastal city. Mara Solis runs the
-garage on the north side and she has work — if he can stay alive to do it.
+Dario Venn arrives in Porto Lumen broke, with nothing but a stolen glance at the
+city's neon bay. Fixer Mara Solis has work for him: five missions across a
+sun-soaked port city — steal a car, run a pickup at the docks, clear the plaza
+of the Viper gang, drive Mara to the safehouse through a three-star manhunt, and
+wreck the boss car at South Pier.
 
-A complete open-world crime game that plays offline in a desktop browser
-from static files, with keyboard and mouse:
+**What you get:** a city to explore on foot and by car (11×11 road grid, park,
+beach and sea, six named districts), traffic and pedestrians, cars to steal and
+drive, a wanted level with police cars and foot police who respond, on-foot and
+driving combat, five story missions, a HUD with minimap, start screen, pause,
+mute, and save/load. All art is drawn in code and all sound is synthesized —
+no external assets, no network requests.
 
-- A city to explore on foot and by car: avenues, blocks, a park, a
-  beachfront and the sea, filled with traffic and pedestrians
-- Cars to steal and drive, with arcade handling and a handbrake
-- A wanted level (0–5 stars) with police cars and foot officers who
-  chase, ram and bust the player
-- Five story missions: steal a car, run a pickup at the docks, clear the
-  plaza of the Viper gang, drive Mara to the safehouse under a 3-star
-  wanted level, and wreck the boss car at the docks
-- Combat with a pistol, ammo to buy or pick up, and a health system
-- A HUD with health, money, ammo, wanted stars, the mission line and a
-  live minimap
-- Save and continue (Q to save, progress kept in localStorage)
-- Synthesized sound: engine hum, siren, gunshots, pickups and jingles —
-  no audio files, no network requests
-
-## Play
-
-Serve `game/` with any static server and open `index.html`, or run
-`node serve.ts` and open http://localhost:8080.
-
-- WASD / arrows — move or drive
-- Mouse — aim, click — shoot
-- E — steal a car / get out / buy ammo at Lumen Arms
-- Shift — sprint, Space — handbrake
-- Q — save, Esc / P — pause, M — mute
-
-## Originality
-
-Everything is original: the city of Porto Lumen, Dario Venn, Mara Solis,
-the Viper gang, the vehicles, the story, the art and the sounds. Nothing
-from Rockstar Games or any other commercial game.
-
-## Entry
-
-Built for make.fun's gta6-01 bounty. `main.ts` (Node 22, standard library
-only) copies `game/` and `screenshots/` to `/output` and writes
-`/output/dossier.json` with the kit's vendored `vendor/makefun-game.ts`.
+**How to play:** serve `game/` with any static server (`node serve.ts`, then open
+http://localhost:8080). WASD/arrows to walk and drive, E to enter/exit a car,
+mouse to aim, click to shoot, Space to brake, Q to save, P to pause, M to mute.
